@@ -636,6 +636,8 @@ def build_sam3_image_model(
     use_act_checkpoint_seg_head: bool = True,
     use_act_checkpoint_geometry: bool = True,
     compile=False,
+    freeze_vision_backbone: bool = False,
+    freeze_text_encoder: bool = False,
 ):
     """
     Build SAM3 image model
@@ -679,6 +681,12 @@ def build_sam3_image_model(
         except Exception:
             # Keep original behavior if inspection fails.
             pass
+
+    if freeze_vision_backbone:
+        use_act_checkpoint_vision = False
+    
+    if freeze_text_encoder:
+        use_act_checkpoint_text = False
 
     # Create visual components
     compile_mode = "default" if compile else None
@@ -737,6 +745,14 @@ def build_sam3_image_model(
     # Load checkpoint if provided
     if checkpoint_path is not None:
         _load_checkpoint(model, checkpoint_path)
+
+    if freeze_vision_backbone:
+        for p in model.backbone.vision_backbone.parameters():
+            p.requires_grad = False
+    
+    if freeze_text_encoder:
+        for p in model.backbone.language_backbone.parameters():
+            p.requires_grad = False
 
     # Setup device and mode
     model = _setup_device_and_mode(model, device, eval_mode)
