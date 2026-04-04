@@ -229,7 +229,7 @@ scratch:
   val_norm_std: [0.5, 0.5, 0.5]
 
   # Training parameters
-  num_train_workers: 2
+  num_train_workers: 0
   num_val_workers: 0
   max_data_epochs: 20
   target_epoch_size: 1500
@@ -352,6 +352,8 @@ trainer:
     enable_segmentation: ${scratch.enable_segmentation} # Warning: Enable this if using segmentation.
     freeze_vision_backbone: True
     freeze_text_encoder: True
+    freeze_transformer_encoder: True
+    freeze_geometry_encoder: True
     use_act_checkpoint_vision: False
     use_act_checkpoint_text: False
     use_act_checkpoint_transformer: False

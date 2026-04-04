@@ -638,6 +638,8 @@ def build_sam3_image_model(
     compile=False,
     freeze_vision_backbone: bool = False,
     freeze_text_encoder: bool = False,
+    freeze_transformer_encoder: bool = False,
+    freeze_geometry_encoder: bool = False,
 ):
     """
     Build SAM3 image model
@@ -752,6 +754,14 @@ def build_sam3_image_model(
     
     if freeze_text_encoder:
         for p in model.backbone.language_backbone.parameters():
+            p.requires_grad = False
+
+    if freeze_transformer_encoder:
+        for p in model.transformer.encoder.parameters():
+            p.requires_grad = False
+
+    if freeze_geometry_encoder:
+        for p in model.geometry_encoder.parameters():
             p.requires_grad = False
 
     # Setup device and mode
