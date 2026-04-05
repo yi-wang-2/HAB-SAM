@@ -137,8 +137,8 @@ def add_pythonpath_to_sys_path():
     sys.path = os.environ["PYTHONPATH"].split(":") + sys.path
 
 
-def main(args) -> None:
-    cfg = compose(config_name=args.config)
+def main(args, unknown_args=[]) -> None:
+    cfg = compose(config_name=args.config, overrides=unknown_args)
     if cfg.launcher.experiment_log_dir is None:
         cfg.launcher.experiment_log_dir = os.path.join(
             os.getcwd(), "sam3_logs", args.config
@@ -332,7 +332,7 @@ if __name__ == "__main__":
         "--num-gpus", type=int, default=None, help="number of GPUS per node"
     )
     parser.add_argument("--num-nodes", type=int, default=None, help="Number of nodes")
-    args = parser.parse_args()
+    args, unknown_args = parser.parse_known_args()
     args.use_cluster = bool(args.use_cluster) if args.use_cluster is not None else None
     register_omegaconf_resolvers()
-    main(args)
+    main(args, unknown_args)

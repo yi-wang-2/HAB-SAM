@@ -38,6 +38,18 @@ class Sam3Processor:
             input_points_mask=None,
         )
 
+    def _normalize_transform_for_channels(self, num_channels: int):
+        if num_channels == 5:
+            self.transform.transforms[-1] = v2.Normalize(
+                mean=[0.5, 0.5, 0.5, 0.5, 0.5],
+                std=[0.5, 0.5, 0.5, 0.5, 0.5],
+            )
+        else:
+            self.transform.transforms[-1] = v2.Normalize(
+                mean=[0.5, 0.5, 0.5],
+                std=[0.5, 0.5, 0.5],
+            )
+
     @torch.inference_mode()
     def set_image(self, image, state=None):
         """Sets the image on which we want to do predictions."""
@@ -46,12 +58,26 @@ class Sam3Processor:
 
         if isinstance(image, PIL.Image.Image):
             width, height = image.size
+            image = v2.functional.to_image(image).to(self.device)
         elif isinstance(image, (torch.Tensor, np.ndarray)):
-            height, width = image.shape[-2:]
+            if isinstance(image, np.ndarray):
+                # Support HWC numpy input (e.g. 5-channel arrays from external maps).
+                if image.ndim == 3 and image.shape[-1] in (3, 5):
+                    height, width = image.shape[0], image.shape[1]
+                else:
+                    height, width = image.shape[-2:]
+            else:
+                # torch.Tensor: support both CHW and HWC
+                if image.ndim == 3 and image.shape[-1] in (3, 5) and image.shape[0] not in (3, 5):
+                    height, width = image.shape[0], image.shape[1]
+                else:
+                    height, width = image.shape[-2:]
+
+            image = v2.functional.to_image(image).to(self.device)
         else:
             raise ValueError("Image must be a PIL image or a tensor")
 
-        image = v2.functional.to_image(image).to(self.device)
+        self._normalize_transform_for_channels(int(image.shape[0]))
         image = self.transform(image).unsqueeze(0)
 
         state["original_height"] = height
@@ -88,10 +114,12 @@ class Sam3Processor:
         state["original_heights"] = [image.height for image in images]
         state["original_widths"] = [image.width for image in images]
 
-        images = [
-            self.transform(v2.functional.to_image(image).to(self.device))
-            for image in images
-        ]
+        _images = []
+        for image in images:
+            img_tensor = v2.functional.to_image(image).to(self.device)
+            self._normalize_transform_for_channels(int(img_tensor.shape[0]))
+            _images.append(self.transform(img_tensor))
+        images = _images
         images = torch.stack(images, dim=0)
         state["backbone_out"] = self.model.backbone.forward_image(images)
         inst_interactivity_en = self.model.inst_interactive_predictor is not None

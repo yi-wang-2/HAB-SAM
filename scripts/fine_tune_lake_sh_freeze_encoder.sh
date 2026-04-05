@@ -65,6 +65,6 @@ export PYTHONPATH="${PYTHONPATH:-}:."
 "${PYTHON_BIN}" sam3/train/train.py \
     -c "${CONFIG_NAME}" \
     --use-cluster "${USE_CLUSTER}" \
-    --num-gpus "${NUM_GPUS}"
+    --num-gpus "${NUM_GPUS}" "$@"
 
 echo "Training command finished."

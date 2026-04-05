@@ -47,6 +47,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt_strategy", default="auto", choices=["auto", "fixed"], help="提示词策略")
     parser.add_argument("--fixed_prompt", default="water", help="固定提示词 (prompt_strategy=fixed)")
     parser.add_argument("--fallback_prompt", default="water", help="自动提示词失败时的回退提示词")
+    parser.add_argument("--use_mask_prompt", action="store_true", help="是否使用 mask prompt")
+    parser.add_argument("--use_5_chan", action="store_true", help="是否使用5通道(原图3通道+差异1通道+absi1通道)")
 
     # LLM 自动提示词配置（可选）
     parser.add_argument("--llm_server_url", default=None, help="OpenAI 兼容服务地址")
@@ -214,6 +216,8 @@ def evaluate_level(
     llm_model: Optional[str],
     mask_threshold: float,
     score_threshold: Optional[float],
+    use_mask_prompt: bool,
+    use_5_chan: bool = False,
 ) -> Dict:
     ensure_dir(output_dir)
     vis_dir = output_dir / "visualizations"
@@ -271,7 +275,44 @@ def evaluate_level(
                 )
 
             image = Image.open(img_path).convert("RGB")
-            inference_state = processor.set_image(image)
+            
+            if use_5_chan:
+                absi_path = Path("data/lake_sh/raw_absi_gray") / level_name / "images" / f"{stem}_raw_absi_gray.png"
+                sub_path = Path("data/lake_sh/subtraction_map_gray") / level_name / "images" / f"{stem}_subtraction_gray.png"
+                if absi_path.exists() and sub_path.exists():
+                    absi_img = Image.open(absi_path).convert("L")
+                    sub_img = Image.open(sub_path).convert("L")
+                    rgb_arr = np.array(image)
+                    absi_arr = np.array(absi_img)[..., None]
+                    sub_arr = np.array(sub_img)[..., None]
+                    model_input_image = np.concatenate([rgb_arr, absi_arr, sub_arr], axis=-1)
+                else:
+                    print(f"[WARN] 找不到额外的五通道文件: {absi_path} / {sub_path}")
+                    rgb_arr = np.array(image)
+                    dummy_arr = np.zeros_like(rgb_arr[..., :2])
+                    model_input_image = np.concatenate([rgb_arr, dummy_arr], axis=-1)
+            else:
+                model_input_image = image
+                
+            inference_state = processor.set_image(model_input_image)
+
+            if use_mask_prompt:
+                p_dir = Path("data/lake_sh/mask-prompt") / level_name / "images"
+                mask_prompt_path = p_dir / f"{stem}_diff_mask.png"
+                if not mask_prompt_path.exists():
+                    mask_prompt_path = next(p_dir.glob(f"{stem}*.png"), None)
+                if mask_prompt_path and mask_prompt_path.exists():
+                    try:
+                        mask_img = Image.open(mask_prompt_path).convert("L")
+                        mask_np = np.array(mask_img)
+                        mask_tensor = torch.from_numpy((mask_np > 127).astype(np.float32)).to(device)
+                        mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0).unsqueeze(0)  # (1, 1, 1, H, W)
+                        if "geometric_prompt" not in inference_state:
+                            inference_state["geometric_prompt"] = processor.model._get_dummy_prompt()
+                        inference_state["geometric_prompt"].append_masks(mask_tensor)
+                    except Exception as e:
+                        print(f"[WARN] 无法读取 mask prompt: {mask_prompt_path}, 错误: {e}")
+
             inference_state = processor.set_text_prompt(state=inference_state, prompt=text_prompt)
 
             masks = inference_state.get("masks")
@@ -289,13 +330,26 @@ def evaluate_level(
                 pred_mask = np.zeros_like(gt_mask)
             else:
                 if pred_mask.shape != gt_mask.shape:
-                    pred_mask_pil = Image.fromarray((pred_mask * 255).astype(np.uint8))
-                    pred_mask_pil = pred_mask_pil.resize((gt_mask.shape[1], gt_mask.shape[0]), Image.NEAREST)
-                    pred_mask = np.array(pred_mask_pil)
+                    # Keep float precision for logits/prob maps when resizing.
+                    pred_mask_t = torch.from_numpy(pred_mask).float().unsqueeze(0).unsqueeze(0)
+                    if pred_mask_is_prob:
+                        pred_mask_t = torch.nn.functional.interpolate(
+                            pred_mask_t,
+                            size=(gt_mask.shape[0], gt_mask.shape[1]),
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                    else:
+                        pred_mask_t = torch.nn.functional.interpolate(
+                            pred_mask_t,
+                            size=(gt_mask.shape[0], gt_mask.shape[1]),
+                            mode="nearest",
+                        )
+                    pred_mask = pred_mask_t.squeeze(0).squeeze(0).cpu().numpy()
                 if pred_mask_is_prob:
                     pred_mask = (pred_mask > mask_threshold).astype(np.uint8)
                 else:
-                    pred_mask = (pred_mask > 127).astype(np.uint8)
+                    pred_mask = (pred_mask > 0.5).astype(np.uint8)
 
             metrics_calculator.update(pred_mask, gt_mask)
 
@@ -380,7 +434,10 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}")
 
-    model = build_sam3_image_model(checkpoint_path=args.checkpoint)
+    model = build_sam3_image_model(
+        checkpoint_path=args.checkpoint, 
+        in_chans=5 if args.use_5_chan else 3
+    )
     model = model.to(device)
     processor = Sam3Processor(model, confidence_threshold=args.confidence_threshold)
 
@@ -408,6 +465,8 @@ def main() -> None:
             llm_model=args.llm_model,
             mask_threshold=args.mask_threshold,
             score_threshold=args.score_threshold,
+            use_mask_prompt=args.use_mask_prompt,
+            use_5_chan=args.use_5_chan,
         )
         if metrics:
             summary[level_name] = metrics

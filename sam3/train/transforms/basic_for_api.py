@@ -114,6 +114,8 @@ def crop(
 
 def hflip(datapoint, index):
     datapoint.images[index].data = F.hflip(datapoint.images[index].data)
+    if getattr(datapoint.images[index], 'extra_maps', None):
+        datapoint.images[index].extra_maps = [F.hflip(emap) for emap in datapoint.images[index].extra_maps]
 
     w, h = datapoint.images[index].data.size
     for obj in datapoint.images[index].objects:
@@ -192,6 +194,8 @@ def resize(datapoint, index, size, max_size=None, square=False, v2=False):
         )
     else:
         datapoint.images[index].data = F.resize(datapoint.images[index].data, size)
+    if getattr(datapoint.images[index], 'extra_maps', None):
+        datapoint.images[index].extra_maps = [F.resize(emap, size) for emap in datapoint.images[index].extra_maps]
 
     new_size = (
         datapoint.images[index].data.size()[-2:][::-1]
@@ -237,6 +241,11 @@ def resize(datapoint, index, size, max_size=None, square=False, v2=False):
 
 
 def pad(datapoint, index, padding, v2=False):
+    if getattr(datapoint.images[index], "extra_maps", None):
+        if len(padding) == 2:
+            datapoint.images[index].extra_maps = [F.pad(emap, (0, 0, padding[0], padding[1])) for emap in datapoint.images[index].extra_maps]
+        else:
+            datapoint.images[index].extra_maps = [F.pad(emap, (padding[0], padding[1], padding[2], padding[3])) for emap in datapoint.images[index].extra_maps]
     old_h, old_w = datapoint.images[index].size
     h, w = old_h, old_w
     if len(padding) == 2:
@@ -876,6 +885,10 @@ class ToTensorAPI:
                 # img.data = Fv2.convert_image_dtype(img.data, torch.uint8)
             else:
                 img.data = F.to_tensor(img.data)
+                if getattr(img, 'extra_maps', None):
+                    extra_t = [F.to_tensor(emap) for emap in img.extra_maps]
+                    img.data = torch.cat([img.data] + extra_t, dim=0)
+
         return datapoint
 
 
@@ -891,7 +904,12 @@ class NormalizeAPI:
                 img.data = Fv2.convert_image_dtype(img.data, torch.float32)
                 img.data = Fv2.normalize(img.data, mean=self.mean, std=self.std)
             else:
-                img.data = F.normalize(img.data, mean=self.mean, std=self.std)
+                mean = self.mean
+                std = self.std
+                if img.data.shape[0] == 5 and len(self.mean) == 3:
+                    mean = list(self.mean) + [0.5, 0.5]
+                    std = list(self.std) + [0.5, 0.5]
+                img.data = F.normalize(img.data, mean=mean, std=std)
             for obj in img.objects:
                 boxes = obj.bbox
                 cur_h, cur_w = img.data.shape[-2:]
@@ -1253,6 +1271,8 @@ class ResizeToMaxIfAbove:
 
         for index in range(len(datapoint.images)):
             datapoint.images[index].data = F.resize(datapoint.images[index].data, size)
+            if getattr(datapoint.images[index], 'extra_maps', None):
+                datapoint.images[index].extra_maps = [F.resize(emap, size) for emap in datapoint.images[index].extra_maps]
 
             for obj in datapoint.images[index].objects:
                 obj.segment = F.resize(

@@ -69,11 +69,13 @@ def _create_position_encoding(precompute_resolution=None):
     )
 
 
-def _create_vit_backbone(compile_mode=None, use_act_checkpoint: bool = True):
+def _create_vit_backbone(compile_mode=None, use_act_checkpoint: bool = True, in_chans: int = 3, use_channel_attention: bool = False):
     """Create ViT backbone for visual feature extraction."""
     return ViT(
         img_size=1008,
         pretrain_img_size=336,
+        in_chans=in_chans,
+        use_channel_attention=use_channel_attention,
         patch_size=14,
         embed_dim=1024,
         depth=32,
@@ -506,6 +508,8 @@ def _create_vision_backbone(
     compile_mode=None,
     enable_inst_interactivity=True,
     use_act_checkpoint: bool = True,
+    in_chans: int = 3,
+    use_channel_attention: bool = False,
 ) -> Sam3DualViTDetNeck:
     """Create SAM3 visual backbone with ViT and neck."""
     # Position encoding
@@ -514,6 +518,8 @@ def _create_vision_backbone(
     vit_backbone: ViT = _create_vit_backbone(
         compile_mode=compile_mode,
         use_act_checkpoint=use_act_checkpoint,
+        in_chans=in_chans,
+        use_channel_attention=use_channel_attention,
     )
     vit_neck: Sam3DualViTDetNeck = _create_vit_neck(
         position_encoding,
@@ -569,6 +575,17 @@ def _load_checkpoint(model, checkpoint_path):
             )
     else:
         sam3_image_ckpt = ckpt
+
+    # Handle 5-channel patch embed mismatch
+    pe_key = "backbone.vision_backbone.trunk.patch_embed.proj.weight"
+    if pe_key in sam3_image_ckpt:
+        ckpt_weight = sam3_image_ckpt[pe_key]
+        model_weight = model.state_dict().get(pe_key)
+        if model_weight is not None and ckpt_weight.shape != model_weight.shape:
+            print(f"Padding {pe_key} from {ckpt_weight.shape} to {model_weight.shape}...")
+            new_weight = torch.zeros_like(model_weight)
+            new_weight[:, :ckpt_weight.shape[1], :, :] = ckpt_weight
+            sam3_image_ckpt[pe_key] = new_weight
 
     missing_keys, unexpected_keys = model.load_state_dict(sam3_image_ckpt, strict=False)
 
@@ -640,6 +657,8 @@ def build_sam3_image_model(
     freeze_text_encoder: bool = False,
     freeze_transformer_encoder: bool = False,
     freeze_geometry_encoder: bool = False,
+    in_chans: int = 3,
+    use_channel_attention: bool = False,
 ):
     """
     Build SAM3 image model
@@ -696,6 +715,8 @@ def build_sam3_image_model(
         compile_mode=compile_mode,
         enable_inst_interactivity=enable_inst_interactivity,
         use_act_checkpoint=use_act_checkpoint_vision,
+        in_chans=in_chans,
+        use_channel_attention=use_channel_attention,
     )
 
     # Create text components
@@ -751,6 +772,13 @@ def build_sam3_image_model(
     if freeze_vision_backbone:
         for p in model.backbone.vision_backbone.parameters():
             p.requires_grad = False
+        # Allow new modules to train
+        if getattr(model.backbone.vision_backbone.trunk, "channel_attention", None) is not None:
+            for p in model.backbone.vision_backbone.trunk.channel_attention.parameters():
+                p.requires_grad = True
+        if getattr(model.backbone.vision_backbone.trunk, "patch_embed", None) is not None:
+            for p in model.backbone.vision_backbone.trunk.patch_embed.parameters():
+                p.requires_grad = True
     
     if freeze_text_encoder:
         for p in model.backbone.language_backbone.parameters():
