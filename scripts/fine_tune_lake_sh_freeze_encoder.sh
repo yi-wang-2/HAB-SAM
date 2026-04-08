@@ -9,6 +9,10 @@
 #   NUM_GPUS=1
 #   USE_CLUSTER=0
 #   DATASET_ROOT=/home/ucas_yw/algorithm/sam3-main/data/lake_sh
+#   AUTO_ACCEPTANCE_CHECK=1
+#   ACCEPTANCE_TRAIN_OUTPUT_DIR=/home/ucas_yw/algorithm/sam3-main/output/lake_sh_fine_tune_freeze_encoder
+#   ACCEPTANCE_EVAL_OUTPUT_DIR=/home/ucas_yw/algorithm/sam3-main/output/leveled_eval_sam3
+#   ACCEPTANCE_STRICT=0
 
 set -euo pipefail
 
@@ -18,6 +22,10 @@ CONFIG_NAME="${CONFIG_NAME:-configs/lake_sh_fine_tune_freeze_encoder.yaml}"
 NUM_GPUS="${NUM_GPUS:-1}"
 USE_CLUSTER="${USE_CLUSTER:-0}"
 DATASET_ROOT="${DATASET_ROOT:-/home/ucas_yw/algorithm/sam3-main/data/lake_sh}"
+AUTO_ACCEPTANCE_CHECK="${AUTO_ACCEPTANCE_CHECK:-1}"
+ACCEPTANCE_TRAIN_OUTPUT_DIR="${ACCEPTANCE_TRAIN_OUTPUT_DIR:-/home/ucas_yw/algorithm/sam3-main/output/lake_sh_fine_tune_freeze_encoder}"
+ACCEPTANCE_EVAL_OUTPUT_DIR="${ACCEPTANCE_EVAL_OUTPUT_DIR:-/home/ucas_yw/algorithm/sam3-main/output/leveled_eval_sam3}"
+ACCEPTANCE_STRICT="${ACCEPTANCE_STRICT:-0}"
 
 TRAIN_JSON="${DATASET_ROOT}/annotations/instances_train.json"
 VAL_JSON="${DATASET_ROOT}/annotations/instances_val.json"
@@ -68,3 +76,20 @@ export PYTHONPATH="${PYTHONPATH:-}:."
     --num-gpus "${NUM_GPUS}" "$@"
 
 echo "Training command finished."
+
+if [[ "${AUTO_ACCEPTANCE_CHECK}" == "1" ]]; then
+    echo "Running post-training acceptance check..."
+    ACCEPT_CMD=(
+        "${PYTHON_BIN}" scripts/auto_acceptance_check.py
+        --train-output-dir "${ACCEPTANCE_TRAIN_OUTPUT_DIR}"
+        --eval-output-dir "${ACCEPTANCE_EVAL_OUTPUT_DIR}"
+        --use-channel-attention
+        --use-vit-adapter
+        --in-chans 5
+        --adapter-init-scale 1.0
+    )
+    if [[ "${ACCEPTANCE_STRICT}" == "1" ]]; then
+        ACCEPT_CMD+=(--strict)
+    fi
+    "${ACCEPT_CMD[@]}"
+fi

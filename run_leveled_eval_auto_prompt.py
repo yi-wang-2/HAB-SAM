@@ -49,6 +49,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fallback_prompt", default="water", help="自动提示词失败时的回退提示词")
     parser.add_argument("--use_mask_prompt", action="store_true", help="是否使用 mask prompt")
     parser.add_argument("--use_5_chan", action="store_true", help="是否使用5通道(原图3通道+差异1通道+absi1通道)")
+    parser.add_argument("--use_channel_attention", action="store_true", help="是否启用输入通道注意力")
+    parser.add_argument("--use_vit_adapter", action="store_true", help="是否使用 ViT adapter")
+    parser.add_argument("--adapter_ratio", type=float, default=8.0, help="ViT adapter ratio")
+    parser.add_argument("--adapter_init_scale", type=float, default=1e-3, help="ViT adapter init scale")
 
     # LLM 自动提示词配置（可选）
     parser.add_argument("--llm_server_url", default=None, help="OpenAI 兼容服务地址")
@@ -436,9 +440,13 @@ def main() -> None:
 
     model = build_sam3_image_model(
         checkpoint_path=args.checkpoint, 
-        in_chans=5 if args.use_5_chan else 3
+        in_chans=5 if args.use_5_chan else 3,
+        use_channel_attention=args.use_channel_attention,
+        use_vit_adapter=args.use_vit_adapter,
+        adapter_ratio=args.adapter_ratio,
+        adapter_init_scale=args.adapter_init_scale
     )
-    model = model.to(device)
+    model = model.eval().to(device)
     processor = Sam3Processor(model, confidence_threshold=args.confidence_threshold)
 
     summary = {}

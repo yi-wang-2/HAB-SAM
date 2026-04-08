@@ -69,13 +69,26 @@ def _create_position_encoding(precompute_resolution=None):
     )
 
 
-def _create_vit_backbone(compile_mode=None, use_act_checkpoint: bool = True, in_chans: int = 3, use_channel_attention: bool = False):
+def _create_vit_backbone(
+    compile_mode=None,
+    use_act_checkpoint: bool = True,
+    in_chans: int = 3,
+    use_channel_attention: bool = False,
+    use_vit_adapter: bool = False,
+    adapter_ratio: float = 8.0,
+    adapter_dropout: float = 0.0,
+    adapter_init_scale: float = 1e-3,
+):
     """Create ViT backbone for visual feature extraction."""
     return ViT(
         img_size=1008,
         pretrain_img_size=336,
         in_chans=in_chans,
         use_channel_attention=use_channel_attention,
+        use_vit_adapter=use_vit_adapter,
+        adapter_ratio=adapter_ratio,
+        adapter_dropout=adapter_dropout,
+        adapter_init_scale=adapter_init_scale,
         patch_size=14,
         embed_dim=1024,
         depth=32,
@@ -510,6 +523,10 @@ def _create_vision_backbone(
     use_act_checkpoint: bool = True,
     in_chans: int = 3,
     use_channel_attention: bool = False,
+    use_vit_adapter: bool = False,
+    adapter_ratio: float = 8.0,
+    adapter_dropout: float = 0.0,
+    adapter_init_scale: float = 1e-3,
 ) -> Sam3DualViTDetNeck:
     """Create SAM3 visual backbone with ViT and neck."""
     # Position encoding
@@ -520,6 +537,10 @@ def _create_vision_backbone(
         use_act_checkpoint=use_act_checkpoint,
         in_chans=in_chans,
         use_channel_attention=use_channel_attention,
+        use_vit_adapter=use_vit_adapter,
+        adapter_ratio=adapter_ratio,
+        adapter_dropout=adapter_dropout,
+        adapter_init_scale=adapter_init_scale,
     )
     vit_neck: Sam3DualViTDetNeck = _create_vit_neck(
         position_encoding,
@@ -659,6 +680,10 @@ def build_sam3_image_model(
     freeze_geometry_encoder: bool = False,
     in_chans: int = 3,
     use_channel_attention: bool = False,
+    use_vit_adapter: bool = False,
+    adapter_ratio: float = 8.0,
+    adapter_dropout: float = 0.0,
+    adapter_init_scale: float = 1e-3,
 ):
     """
     Build SAM3 image model
@@ -717,6 +742,10 @@ def build_sam3_image_model(
         use_act_checkpoint=use_act_checkpoint_vision,
         in_chans=in_chans,
         use_channel_attention=use_channel_attention,
+        use_vit_adapter=use_vit_adapter,
+        adapter_ratio=adapter_ratio,
+        adapter_dropout=adapter_dropout,
+        adapter_init_scale=adapter_init_scale,
     )
 
     # Create text components
@@ -779,6 +808,18 @@ def build_sam3_image_model(
         if getattr(model.backbone.vision_backbone.trunk, "patch_embed", None) is not None:
             for p in model.backbone.vision_backbone.trunk.patch_embed.parameters():
                 p.requires_grad = True
+        if getattr(model.backbone.vision_backbone.trunk, "blocks", None) is not None:
+            for block in model.backbone.vision_backbone.trunk.blocks:
+                if getattr(block, "adapter_attn", None) is not None:
+                    for p in block.adapter_attn.parameters():
+                        p.requires_grad = True
+                if getattr(block, "adapter_post", None) is not None:
+                    for p in block.adapter_post.parameters():
+                        p.requires_grad = True
+                if getattr(block, "adapter_attn_scale", None) is not None:
+                    block.adapter_attn_scale.requires_grad = True
+                if getattr(block, "adapter_post_scale", None) is not None:
+                    block.adapter_post_scale.requires_grad = True
     
     if freeze_text_encoder:
         for p in model.backbone.language_backbone.parameters():

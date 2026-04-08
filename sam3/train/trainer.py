@@ -166,6 +166,8 @@ class Trainer:
         loss: Optional[Dict[str, Any]] = None,
         skip_first_val: bool = False,
         skip_saving_ckpts: bool = False,
+        early_stopping_patience: int = 0,
+        early_stopping_metric: str = "Meters_train/val_lake_sh/segmentation/coco_eval_segm_AP",
         empty_gpu_mem_cache_after_eval: bool = True,
         gradient_accumulation_steps: int = 1,
     ):
@@ -189,6 +191,8 @@ class Trainer:
 
         self.skip_first_val = skip_first_val
         self.skip_saving_ckpts = skip_saving_ckpts
+        self.early_stopping_patience = early_stopping_patience
+        self.early_stopping_metric = early_stopping_metric
         self.empty_gpu_mem_cache_after_eval = empty_gpu_mem_cache_after_eval
 
         self._infer_distributed_backend_if_none(distributed, accelerator)
@@ -578,6 +582,8 @@ class Trainer:
             self.train_dataset = instantiate(self.data_conf.train)
 
     def run_train(self):
+        best_metric_val = -float('inf')
+        epochs_without_improvement = 0
         while self.epoch < self.max_epochs:
             dataloader = self.train_dataset.get_loader(epoch=int(self.epoch))
             barrier()
@@ -598,6 +604,8 @@ class Trainer:
             del dataloader
             gc.collect()
 
+            should_stop = torch.tensor(0, device=self.device)
+
             # Run val, not running on last epoch since will run after the
             # loop anyway
             if self.is_intermediate_val_epoch(self.epoch):
@@ -606,6 +614,33 @@ class Trainer:
                     # release memory buffers held by the model during eval (which typically
                     # involves a lot more frames in video grounding that during training)
                     torch.cuda.empty_cache()
+
+                # Get early stopping metric
+                current_metric = None
+                if self.early_stopping_patience > 0:
+                    val_state = self._get_trainer_state("val")
+                    if self.early_stopping_metric in val_state:
+                        current_metric = val_state[self.early_stopping_metric]
+                    if current_metric is not None:
+                        if current_metric > best_metric_val:
+                            best_metric_val = current_metric
+                            epochs_without_improvement = 0
+                        else:
+                            epochs_without_improvement += 1
+                        
+                        if epochs_without_improvement >= self.early_stopping_patience:
+                            logging.info(f"Early stopping triggered at epoch {self.epoch} due to no improvement in {self.early_stopping_metric} for {self.early_stopping_patience} epochs.")
+                            should_stop.fill_(1)
+
+            if self.distributed_rank != 0:
+                if torch.distributed.is_initialized():
+                    torch.distributed.broadcast(should_stop, src=0)
+            else:
+                if torch.distributed.is_initialized():
+                    torch.distributed.broadcast(should_stop, src=0)
+
+            if should_stop.item() == 1:
+                break
 
             if self.distributed_rank == 0:
                 self.best_meter_values.update(self._get_trainer_state("train"))

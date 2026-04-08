@@ -541,6 +541,10 @@ class Block(nn.Module):
         cls_token: bool = False,
         dropout: float = 0.0,
         init_values: Optional[float] = None,
+        use_adapter: bool = False,
+        adapter_ratio: float = 8.0,
+        adapter_dropout: float = 0.0,
+        adapter_init_scale: float = 1e-3,
     ):
         """
         Args:
@@ -596,6 +600,29 @@ class Block(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.window_size = window_size
 
+        self.use_adapter = use_adapter
+        if self.use_adapter:
+            adapter_hidden = max(1, int(dim / adapter_ratio))
+            self.adapter_attn = nn.Sequential(
+                norm_layer(dim),
+                nn.Linear(dim, adapter_hidden),
+                act_layer(),
+                nn.Dropout(adapter_dropout),
+                nn.Linear(adapter_hidden, dim),
+            )
+            self.adapter_post = nn.Sequential(
+                norm_layer(dim),
+                nn.Linear(dim, adapter_hidden),
+                act_layer(),
+                nn.Dropout(adapter_dropout),
+                nn.Linear(adapter_hidden, dim),
+            )
+            self.adapter_post_scale = nn.Parameter(torch.tensor(adapter_init_scale))
+        else:
+            self.adapter_attn = None
+            self.adapter_post = None
+            self.adapter_post_scale = None
+
     def forward(self, x: Tensor) -> Tensor:
         shortcut = x
         x = self.norm1(x)
@@ -609,11 +636,61 @@ class Block(nn.Module):
         if self.window_size > 0:
             x = window_unpartition(x, self.window_size, pad_hw, (H, W))
 
+        if self.use_adapter:
+            x = x + self.adapter_attn(x)
+
         x = shortcut + self.dropout(self.drop_path(x))
-        x = x + self.dropout(self.drop_path(self.ls2(self.mlp(self.norm2(x)))))
+
+        residual = x
+        if self.use_adapter:
+            residual = residual + self.adapter_post_scale * self.adapter_post(residual)
+        x = residual + self.dropout(self.drop_path(self.ls2(self.mlp(self.norm2(x)))))
 
         return x
 
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = 3 if kernel_size == 7 else 1
+        # 添加 bias 并且初始化为一个较大的正数，保证 Sigmoid(y) 初始值接近 1.0 (Identity)
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=True)
+        nn.init.constant_(self.conv1.bias, 5.0)
+        nn.init.zeros_(self.conv1.weight)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        y = torch.cat([avg_out, max_out], dim=1)
+        y = self.conv1(y)
+        return x * self.sigmoid(y)
+
+class InputChannelAttention(nn.Module):
+    def __init__(self, in_chans, reduction=2):
+        super().__init__()
+        mid_chans = max(1, in_chans // reduction)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        # 最后一层加 bias，并初始化为 5.0，保证通道门控起点接近 1.0
+        self.fc = nn.Sequential(
+            nn.Linear(in_chans, mid_chans, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(mid_chans, in_chans, bias=True)
+        )
+        nn.init.constant_(self.fc[2].bias, 5.0)
+        nn.init.zeros_(self.fc[2].weight)
+        self.sigmoid_ca = nn.Sigmoid()
+        self.spatial_attention = SpatialAttention(kernel_size=7)
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y_avg = self.fc(self.avg_pool(x).view(b, c))
+        y_max = self.fc(self.max_pool(x).view(b, c))
+        y_c = self.sigmoid_ca(y_avg + y_max).view(b, c, 1, 1)
+        x_c = x * y_c.expand_as(x)
+        return self.spatial_attention(x_c)
 
 class ViT(nn.Module):
     """
@@ -655,6 +732,11 @@ class ViT(nn.Module):
         bias_patch_embed: bool = True,
         compile_mode: Optional[str] = None,
         use_act_checkpoint: bool = True,
+        use_channel_attention: bool = False,
+        use_vit_adapter: bool = False,
+        adapter_ratio: float = 8.0,
+        adapter_dropout: float = 0.0,
+        adapter_init_scale: float = 1e-3,
     ):
         """
         Args:
@@ -720,6 +802,12 @@ class ViT(nn.Module):
         if isinstance(norm_layer, str):
             norm_layer = partial(getattr(nn, norm_layer), eps=1e-5)
 
+        self.use_channel_attention = use_channel_attention
+        if self.use_channel_attention:
+            self.channel_attention = InputChannelAttention(in_chans=in_chans)
+        else:
+            self.channel_attention = None
+
         self.patch_embed = PatchEmbed(
             kernel_size=(patch_size, patch_size),
             stride=(patch_size, patch_size),
@@ -772,6 +860,10 @@ class ViT(nn.Module):
                 cls_token=self.retain_cls_token,
                 dropout=dropout,
                 init_values=init_values,
+                use_adapter=use_vit_adapter,
+                adapter_ratio=adapter_ratio,
+                adapter_dropout=adapter_dropout,
+                adapter_init_scale=adapter_init_scale,
             )
 
             if i not in window_block_indexes:
@@ -813,6 +905,8 @@ class ViT(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
+        if self.use_channel_attention and self.channel_attention is not None:
+            x = self.channel_attention(x)
         x = self.patch_embed(x)
         h, w = x.shape[1], x.shape[2]
 

@@ -231,7 +231,7 @@ scratch:
   # Training parameters
   num_train_workers: 0
   num_val_workers: 0
-  max_data_epochs: 20
+  max_data_epochs: 30
   target_epoch_size: 1500
   hybrid_repeats: 32
   context_length: 2
@@ -240,7 +240,7 @@ scratch:
   # Learning rate and scheduler parameters
   lr_scale: 0.1
   lr_transformer: ${times:8e-4,${scratch.lr_scale}}
-  lr_vision_backbone: 0.0
+  lr_vision_backbone: ${times:2.5e-4,${scratch.lr_scale}}
   lr_language_backbone: 0.0
   lrd_vision_backbone: 0.9
   wd: 0.1
@@ -276,7 +276,9 @@ trainer:
   skip_saving_ckpts: false
   empty_gpu_mem_cache_after_eval: True
   skip_first_val: False
-  max_epochs: 20
+  max_epochs: 30
+  early_stopping_patience: 5
+  early_stopping_metric: "Meters_train/val_lake_sh/segmentation/coco_eval_segm_AP"
   accelerator: cuda
   seed_value: 123
   val_epoch_freq: 1
