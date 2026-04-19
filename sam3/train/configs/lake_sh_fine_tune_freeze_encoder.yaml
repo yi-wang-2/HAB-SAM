@@ -47,6 +47,8 @@ roboflow_train:
         - _target_: sam3.train.transforms.basic_for_api.NormalizeAPI
           mean: ${scratch.train_norm_mean}
           std: ${scratch.train_norm_std}
+          extra_mean: ${scratch.extra_chan_mean}
+          extra_std: ${scratch.extra_chan_std}
         - _target_: sam3.train.transforms.filter_query_transforms.FlexibleFilterFindGetQueries
           query_filter:
             _target_: sam3.train.transforms.filter_query_transforms.FilterEmptyTargets
@@ -71,6 +73,8 @@ roboflow_train:
         - _target_: sam3.train.transforms.basic_for_api.NormalizeAPI
           mean: ${scratch.train_norm_mean}
           std: ${scratch.train_norm_std}
+          extra_mean: ${scratch.extra_chan_mean}
+          extra_std: ${scratch.extra_chan_std}
 
   # loss config (no mask loss)
   loss:
@@ -86,8 +90,8 @@ roboflow_train:
     loss_fns_find:
       - _target_: sam3.train.loss.loss_fns.Boxes
         weight_dict:
-          loss_bbox: 5.0
-          loss_giou: 2.0
+          loss_bbox: 1.0
+          loss_giou: 0.5
       - _target_: sam3.train.loss.loss_fns.IABCEMdetr
         weak_loss: False
         weight_dict:
@@ -104,8 +108,10 @@ roboflow_train:
         focal_alpha: 0.25
         focal_gamma: 2.0
         weight_dict:
-          loss_mask: 200.0
-          loss_dice: 10.0
+          loss_mask: 120.0
+          loss_dice: 50.0
+          loss_tv: 5
+          loss_boundary: 20.0
         compute_aux: false
 
     loss_fn_semantic_seg:
@@ -117,9 +123,9 @@ roboflow_train:
       focal_gamma: 2.0
       downsample: False
       weight_dict:
-        loss_semantic_seg: 20.0
+        loss_semantic_seg: 30.0
         loss_semantic_presence: 1.0
-        loss_semantic_dice: 30.0
+        loss_semantic_dice: 40.0
 
     scale_by_find_batch_size: ${scratch.scale_by_find_batch_size}
 
@@ -191,13 +197,13 @@ scratch:
   use_presence_eval: True
   original_box_postprocessor:
     _target_: sam3.eval.postprocessors.PostProcessImage
-    max_dets_per_img: -1  # infinite detections
+    max_dets_per_img: 20  # reduce eval memory spike during prediction sync
     use_original_ids: true
     use_original_sizes_box: true
     use_presence: ${scratch.use_presence_eval}
   original_mask_postprocessor:
     _target_: sam3.eval.postprocessors.PostProcessImage
-    max_dets_per_img: -1  # infinite detections
+    max_dets_per_img: 20  # reduce eval memory spike during prediction sync
     use_original_ids: true
     use_original_sizes_box: true
     use_original_sizes_mask: true
@@ -227,20 +233,23 @@ scratch:
   train_norm_std: [0.5, 0.5, 0.5]
   val_norm_mean: [0.5, 0.5, 0.5]
   val_norm_std: [0.5, 0.5, 0.5]
+  extra_chan_mean: [0.55862757, 0.02709984]
+  extra_chan_std: [0.06030450, 0.07032378]
 
   # Training parameters
-  num_train_workers: 0
-  num_val_workers: 0
+  num_train_workers: 2
+  num_val_workers: 1
   max_data_epochs: 30
   target_epoch_size: 1500
   hybrid_repeats: 32
   context_length: 2
-  gather_pred_via_filesys: false
+  gather_pred_via_filesys: true
 
   # Learning rate and scheduler parameters
   lr_scale: 0.1
   lr_transformer: ${times:8e-4,${scratch.lr_scale}}
   lr_vision_backbone: ${times:2.5e-4,${scratch.lr_scale}}
+  lr_new_modules_mult: 4.0  # dedicated LR multiplier for newly introduced vision modules
   lr_language_backbone: 0.0
   lrd_vision_backbone: 0.9
   wd: 0.1
@@ -275,13 +284,13 @@ trainer:
   _target_: sam3.train.trainer.Trainer
   skip_saving_ckpts: false
   empty_gpu_mem_cache_after_eval: True
-  skip_first_val: False
+  skip_first_val: True
   max_epochs: 30
   early_stopping_patience: 5
   early_stopping_metric: "Meters_train/val_lake_sh/segmentation/coco_eval_segm_AP"
   accelerator: cuda
   seed_value: 123
-  val_epoch_freq: 1
+  val_epoch_freq: 5
   mode: train
   gradient_accumulation_steps: ${scratch.gradient_accumulation_steps}
 
@@ -303,10 +312,10 @@ trainer:
         limit_ids: ${roboflow_train.num_images}
         transforms: ${roboflow_train.train_transforms}
         load_segmentation: ${scratch.enable_segmentation}
-        max_ann_per_img: 500000
+        max_ann_per_img: 50
         multiplier: 1
-        max_train_queries: 50000
-        max_val_queries: 50000
+        max_train_queries: 50
+        max_val_queries: 50
         training: true
         use_caching: False
         img_folder: ${paths.lake_sh_root}/images/
@@ -332,7 +341,7 @@ trainer:
         img_folder: ${paths.lake_sh_root}/images/
         ann_file: ${paths.lake_sh_root}/annotations/instances_val.json
         transforms: ${roboflow_train.val_transforms}
-        max_ann_per_img: 100000
+        max_ann_per_img: 100
         multiplier: 1
         training: false
 
@@ -361,6 +370,12 @@ trainer:
     use_act_checkpoint_transformer: False
     use_act_checkpoint_seg_head: False
     use_act_checkpoint_geometry: False
+    in_chans: 5
+    use_channel_attention: True
+    use_vit_adapter: True
+    adapter_ratio: 8.0
+    adapter_dropout: 0.0
+    adapter_init_scale: 1.0e-3
 
   meters:
     val:
@@ -413,7 +428,16 @@ trainer:
         overrides:
           - pattern: '*pos_embed*'
             value: 1.0
-
+          - pattern: 'backbone.vision_backbone.trunk.channel_attention.*'
+            value: ${scratch.lr_new_modules_mult}
+          - pattern: 'backbone.vision_backbone.trunk.patch_embed.proj.weight'
+            value: ${scratch.lr_new_modules_mult}
+          - pattern: 'backbone.vision_backbone.trunk.blocks.*.adapter_attn*'
+            value: ${scratch.lr_new_modules_mult}
+          - pattern: 'backbone.vision_backbone.trunk.blocks.*.adapter_post*'
+            value: ${scratch.lr_new_modules_mult}
+          - pattern: 'backbone.vision_backbone.trunk.blocks.*.adapter_*_scale'
+            value: ${scratch.lr_new_modules_mult}
     options:
       lr:
         - scheduler:  # transformer and class_embed
@@ -449,10 +473,18 @@ trainer:
           param_names:
             - '*bias*'
           module_cls_names: ['torch.nn.LayerNorm']
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+            value: 0.0
+          param_names:
+            - 'backbone.vision_backbone.trunk.patch_embed.proj.weight'
 
   checkpoint:
     save_dir: ${launcher.experiment_log_dir}/checkpoints
     save_freq: 0  # 0 only last checkpoint is saved.
+    save_best_meters:
+      - val_lake_sh/segmentation/coco_eval_segm_AP
+    save_best_topk: 2
 
   logging:
     tensorboard_writer:

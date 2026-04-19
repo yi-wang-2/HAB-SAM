@@ -893,22 +893,25 @@ class ToTensorAPI:
 
 
 class NormalizeAPI:
-    def __init__(self, mean, std, v2=False):
+    def __init__(self, mean, std, v2=False, extra_mean=None, extra_std=None):
         self.mean = mean
         self.std = std
         self.v2 = v2
+        self.extra_mean = [0.5, 0.5] if extra_mean is None else list(extra_mean)
+        self.extra_std = [0.5, 0.5] if extra_std is None else list(extra_std)
 
     def __call__(self, datapoint: Datapoint, **kwargs):
         for img in datapoint.images:
+            mean = self.mean
+            std = self.std
+            if img.data.shape[0] == 5 and len(self.mean) == 3:
+                mean = list(self.mean) + list(self.extra_mean)
+                std = list(self.std) + list(self.extra_std)
+
             if self.v2:
                 img.data = Fv2.convert_image_dtype(img.data, torch.float32)
-                img.data = Fv2.normalize(img.data, mean=self.mean, std=self.std)
+                img.data = Fv2.normalize(img.data, mean=mean, std=std)
             else:
-                mean = self.mean
-                std = self.std
-                if img.data.shape[0] == 5 and len(self.mean) == 3:
-                    mean = list(self.mean) + [0.5, 0.5]
-                    std = list(self.std) + [0.5, 0.5]
                 img.data = F.normalize(img.data, mean=mean, std=std)
             for obj in img.objects:
                 boxes = obj.bbox

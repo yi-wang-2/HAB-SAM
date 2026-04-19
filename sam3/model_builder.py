@@ -565,10 +565,24 @@ def _create_sam3_transformer(
     return TransformerWrapper(encoder=encoder, decoder=decoder, d_model=256)
 
 
+def _torch_load_compat(file_obj):
+    """Load checkpoint compatibly across PyTorch versions.
+
+    PyTorch >=2.6 defaults to weights_only=True, which may fail for trusted
+    training checkpoints containing non-tensor metadata.
+    """
+    try:
+        return torch.load(file_obj, map_location="cpu", weights_only=False)
+    except TypeError:
+        # Older PyTorch versions do not support `weights_only`.
+        file_obj.seek(0)
+        return torch.load(file_obj, map_location="cpu")
+
+
 def _load_checkpoint(model, checkpoint_path):
     """Load model checkpoint from file."""
     with g_pathmgr.open(checkpoint_path, "rb") as f:
-        ckpt = torch.load(f, map_location="cpu", weights_only=True)
+        ckpt = _torch_load_compat(f)
     if "model" in ckpt and isinstance(ckpt["model"], dict):
         ckpt = ckpt["model"]
 
@@ -631,7 +645,7 @@ def _load_checkpoint(model, checkpoint_path):
 def _peek_checkpoint_format(checkpoint_path):
     """Inspect checkpoint key namespace to choose compatible model build options."""
     with g_pathmgr.open(checkpoint_path, "rb") as f:
-        ckpt = torch.load(f, map_location="cpu", weights_only=True)
+        ckpt = _torch_load_compat(f)
     if "model" in ckpt and isinstance(ckpt["model"], dict):
         ckpt = ckpt["model"]
     if not isinstance(ckpt, dict):
@@ -806,8 +820,26 @@ def build_sam3_image_model(
             for p in model.backbone.vision_backbone.trunk.channel_attention.parameters():
                 p.requires_grad = True
         if getattr(model.backbone.vision_backbone.trunk, "patch_embed", None) is not None:
-            for p in model.backbone.vision_backbone.trunk.patch_embed.parameters():
-                p.requires_grad = True
+            patch_embed = model.backbone.vision_backbone.trunk.patch_embed
+            proj = getattr(patch_embed, "proj", None)
+            if proj is not None and getattr(proj, "weight", None) is not None:
+                proj.weight.requires_grad = True
+                # For 5-channel finetuning, keep pretrained RGB kernels frozen and
+                # update only the newly introduced extra-channel kernels.
+                if in_chans > 3 and proj.weight.shape[1] >= in_chans:
+                    frozen_in_chans = 3
+
+                    def _freeze_pretrained_rgb_grad(grad):
+                        grad = grad.clone()
+                        grad[:, :frozen_in_chans, ...] = 0
+                        return grad
+
+                    proj.weight.register_hook(_freeze_pretrained_rgb_grad)
+                if getattr(proj, "bias", None) is not None:
+                    proj.bias.requires_grad = False
+            else:
+                for p in patch_embed.parameters():
+                    p.requires_grad = True
         if getattr(model.backbone.vision_backbone.trunk, "blocks", None) is not None:
             for block in model.backbone.vision_backbone.trunk.blocks:
                 if getattr(block, "adapter_attn", None) is not None:
@@ -973,7 +1005,7 @@ def build_sam3_video_model(
         checkpoint_path = download_ckpt_from_hf()
     if checkpoint_path is not None:
         with g_pathmgr.open(checkpoint_path, "rb") as f:
-            ckpt = torch.load(f, map_location="cpu", weights_only=True)
+            ckpt = _torch_load_compat(f)
         if "model" in ckpt and isinstance(ckpt["model"], dict):
             ckpt = ckpt["model"]
 

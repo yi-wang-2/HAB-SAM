@@ -112,6 +112,7 @@ class CheckpointConf:
     save_list: List[int] = field(default_factory=list)
     model_weight_initializer: Any = None
     save_best_meters: List[str] = None
+    save_best_topk: int = 1
     skip_saving_parameters: List[str] = field(default_factory=list)
     initialize_after_preemption: Optional[bool] = None
     # if not None, training will be resumed from this checkpoint
@@ -193,6 +194,7 @@ class Trainer:
         self.skip_saving_ckpts = skip_saving_ckpts
         self.early_stopping_patience = early_stopping_patience
         self.early_stopping_metric = early_stopping_metric
+        self._early_stopping_warned_missing_metric = False
         self.empty_gpu_mem_cache_after_eval = empty_gpu_mem_cache_after_eval
 
         self._infer_distributed_backend_if_none(distributed, accelerator)
@@ -367,6 +369,7 @@ class Trainer:
             "steps": self.steps,
             "time_elapsed": self.time_elapsed_meter.val,
             "best_meter_values": self.best_meter_values,
+            "best_meter_topk_records": self.best_meter_topk_records,
         }
         if self.optim_conf.amp.enabled:
             checkpoint["scaler"] = self.scaler.state_dict()
@@ -441,7 +444,12 @@ class Trainer:
         logging.info(f"Resuming training from {ckpt_path}")
 
         with g_pathmgr.open(ckpt_path, "rb") as f:
-            checkpoint = torch.load(f, map_location="cpu")
+            try:
+                checkpoint = torch.load(f, map_location="cpu", weights_only=False)
+            except TypeError:
+                # Backward compatibility for older PyTorch versions without `weights_only`.
+                f.seek(0)
+                checkpoint = torch.load(f, map_location="cpu")
         load_state_dict_into_model(
             model=self.model,
             state_dict=checkpoint["model"],
@@ -458,6 +466,7 @@ class Trainer:
             self.scaler.load_state_dict(checkpoint["scaler"])
 
         self.best_meter_values = checkpoint.get("best_meter_values", {})
+        self.best_meter_topk_records = checkpoint.get("best_meter_topk_records", {})
 
         if "train_dataset" in checkpoint and self.train_dataset is not None:
             self.train_dataset.load_checkpoint_state(checkpoint["train_dataset"])
@@ -559,7 +568,7 @@ class Trainer:
             if self.epoch > 0:
                 logging.info(f"Resuming training from epoch: {self.epoch}")
                 # resuming from a checkpoint
-                if self.is_intermediate_val_epoch(self.epoch - 1):
+                if self.is_intermediate_val_epoch(self.epoch - 1) and not self.skip_first_val:
                     logging.info("Running previous val epoch")
                     self.epoch -= 1
                     self.run_val()
@@ -582,8 +591,9 @@ class Trainer:
             self.train_dataset = instantiate(self.data_conf.train)
 
     def run_train(self):
-        best_metric_val = -float('inf')
+        best_metric_val = None
         epochs_without_improvement = 0
+        is_better_early_stop = self._default_is_better(self.early_stopping_metric)
         while self.epoch < self.max_epochs:
             dataloader = self.train_dataset.get_loader(epoch=int(self.epoch))
             barrier()
@@ -609,7 +619,7 @@ class Trainer:
             # Run val, not running on last epoch since will run after the
             # loop anyway
             if self.is_intermediate_val_epoch(self.epoch):
-                self.run_val()
+                val_outs = self.run_val()
                 if torch.cuda.is_available() and self.empty_gpu_mem_cache_after_eval:
                     # release memory buffers held by the model during eval (which typically
                     # involves a lot more frames in video grounding that during training)
@@ -618,19 +628,29 @@ class Trainer:
                 # Get early stopping metric
                 current_metric = None
                 if self.early_stopping_patience > 0:
-                    val_state = self._get_trainer_state("val")
-                    if self.early_stopping_metric in val_state:
-                        current_metric = val_state[self.early_stopping_metric]
+                    current_metric = self._resolve_metric_value(
+                        val_outs,
+                        self.early_stopping_metric,
+                    )
                     if current_metric is not None:
-                        if current_metric > best_metric_val:
+                        if best_metric_val is None or is_better_early_stop(
+                            current_metric,
+                            best_metric_val,
+                        ):
                             best_metric_val = current_metric
                             epochs_without_improvement = 0
                         else:
                             epochs_without_improvement += 1
-                        
+
                         if epochs_without_improvement >= self.early_stopping_patience:
                             logging.info(f"Early stopping triggered at epoch {self.epoch} due to no improvement in {self.early_stopping_metric} for {self.early_stopping_patience} epochs.")
                             should_stop.fill_(1)
+                    elif not self._early_stopping_warned_missing_metric:
+                        logging.warning(
+                            f"Early stopping metric '{self.early_stopping_metric}' was not found in validation outputs. "
+                            "Early stopping is disabled until a matching metric key is produced."
+                        )
+                        self._early_stopping_warned_missing_metric = True
 
             if self.distributed_rank != 0:
                 if torch.distributed.is_initialized():
@@ -656,7 +676,7 @@ class Trainer:
 
     def run_val(self):
         if not self.val_dataset:
-            return
+            return None
 
         dataloader = self.val_dataset.get_loader(epoch=int(self.epoch))
         outs = self.val_epoch(dataloader, phase=Phase.VAL)
@@ -670,6 +690,35 @@ class Trainer:
                 "a",
             ) as f:
                 f.write(json.dumps(outs) + "\n")
+
+        return outs
+
+    @staticmethod
+    def _resolve_metric_value(metrics_dict, configured_metric_key):
+        if not metrics_dict or not configured_metric_key:
+            return None
+
+        metric_key = str(configured_metric_key)
+        candidates = [metric_key]
+
+        meters_prefix = "Meters_train/"
+        if metric_key.startswith(meters_prefix):
+            candidates.append(metric_key[len(meters_prefix) :])
+        else:
+            candidates.append(os.path.join(meters_prefix.rstrip("/"), metric_key))
+
+        seen = set()
+        for key in candidates:
+            if key in seen:
+                continue
+            seen.add(key)
+            if key in metrics_dict:
+                try:
+                    return float(metrics_dict[key])
+                except (TypeError, ValueError):
+                    return None
+
+        return None
 
     def val_epoch(self, val_loader, phase):
         batch_time = AverageMeter("Batch Time", self.device, ":.2f")
@@ -1004,6 +1053,7 @@ class Trainer:
         logging.info("Synchronizing meters")
         out_dict = {}
         checkpoint_save_keys = []
+        tracked = self.checkpoint_conf.save_best_meters
         for key, meter in self._get_meters(phases).items():
             meter_output = meter.compute_synced()
             is_better_check = getattr(meter, "is_better", None)
@@ -1011,26 +1061,106 @@ class Trainer:
             for meter_subkey, meter_value in meter_output.items():
                 out_dict[os.path.join("Meters_train", key, meter_subkey)] = meter_value
 
+                tracked_meter_key = os.path.join(key, meter_subkey)
+                is_tracked_meter = tracked is not None and (
+                    (key in tracked) or (tracked_meter_key in tracked)
+                )
+
+                # Some meters (e.g., COCO PredictionDumper) do not expose `is_better`.
+                # For explicitly tracked checkpoint metrics, fall back to a default comparator.
+                if is_better_check is None and is_tracked_meter:
+                    is_better_check = self._default_is_better(tracked_meter_key)
+
                 if is_better_check is None:
                     continue
 
-                tracked_meter_key = os.path.join(key, meter_subkey)
                 if tracked_meter_key not in self.best_meter_values or is_better_check(
                     meter_value,
                     self.best_meter_values[tracked_meter_key],
                 ):
                     self.best_meter_values[tracked_meter_key] = meter_value
 
-                    if (
-                        self.checkpoint_conf.save_best_meters is not None
-                        and key in self.checkpoint_conf.save_best_meters
-                    ):
-                        checkpoint_save_keys.append(tracked_meter_key.replace("/", "_"))
+                if is_tracked_meter:
+                    checkpoint_save_keys.extend(
+                        self._update_and_collect_topk_checkpoint_names(
+                            tracked_meter_key, meter_value, is_better_check
+                        )
+                    )
+
+        # Fallback path: force tracking by explicit configured meter keys.
+        # This avoids misses caused by meter key/subkey naming differences.
+        if tracked is not None:
+            for configured_key in tracked:
+                configured_key = str(configured_key)
+                full_key = os.path.join("Meters_train", configured_key)
+                if full_key not in out_dict:
+                    continue
+                meter_value = out_dict[full_key]
+                is_better_check = self._default_is_better(configured_key)
+                if configured_key not in self.best_meter_values or is_better_check(
+                    meter_value,
+                    self.best_meter_values[configured_key],
+                ):
+                    self.best_meter_values[configured_key] = meter_value
+                checkpoint_save_keys.extend(
+                    self._update_and_collect_topk_checkpoint_names(
+                        configured_key, meter_value, is_better_check
+                    )
+                )
 
         if len(checkpoint_save_keys) > 0:
+            checkpoint_save_keys = list(dict.fromkeys(checkpoint_save_keys))
+            logging.info(f"Saving tracked best checkpoints: {checkpoint_save_keys}")
             self.save_checkpoint(self.epoch + 1, checkpoint_save_keys)
 
         return out_dict
+
+    @staticmethod
+    def _default_is_better(tracked_meter_key: str):
+        lowered = tracked_meter_key.lower()
+        lower_is_better_hints = ("loss", "error", "mae", "rmse", "wer", "cer")
+        if any(hint in lowered for hint in lower_is_better_hints):
+            return lambda cur, best: float(cur) < float(best)
+        return lambda cur, best: float(cur) > float(best)
+
+    def _update_and_collect_topk_checkpoint_names(self, tracked_meter_key, meter_value, is_better_check):
+        if self.checkpoint_conf.save_best_topk <= 0:
+            return []
+
+        k = int(self.checkpoint_conf.save_best_topk)
+        records = self.best_meter_topk_records.get(tracked_meter_key, [])
+
+        epoch_num = int(self.epoch + 1)
+        ckpt_name = f"{tracked_meter_key.replace('/', '_')}_epoch{epoch_num}"
+        candidate = {
+            "epoch": epoch_num,
+            "value": float(meter_value),
+            "ckpt_name": ckpt_name,
+        }
+
+        insert_idx = len(records)
+        for i, rec in enumerate(records):
+            if is_better_check(float(meter_value), float(rec["value"])):
+                insert_idx = i
+                break
+
+        if insert_idx >= k:
+            return []
+
+        records.insert(insert_idx, candidate)
+        dropped = None
+        if len(records) > k:
+            dropped = records.pop()
+
+        self.best_meter_topk_records[tracked_meter_key] = records
+
+        # remove dropped checkpoint file if exists
+        if dropped is not None and self.distributed_rank == 0:
+            drop_path = os.path.join(self.checkpoint_conf.save_dir, f"{dropped['ckpt_name']}.pt")
+            if g_pathmgr.exists(drop_path):
+                g_pathmgr.rm(drop_path)
+
+        return [ckpt_name]
 
     def _log_timers(self, phase):
         time_remaining = 0
@@ -1116,6 +1246,7 @@ class Trainer:
 
         self.meters = {}
         self.best_meter_values = {}
+        self.best_meter_topk_records = {}
         if self.meters_conf:
             self.meters = instantiate(self.meters_conf, _convert_="all")
 

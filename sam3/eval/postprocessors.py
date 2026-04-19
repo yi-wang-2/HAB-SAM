@@ -111,6 +111,37 @@ class PostProcessImage(nn.Module):
             target_sizes_boxes, forced_labels, out_bbox, out_probs
         )
         assert boxes is None or len(boxes) == batch_size
+
+        # Eager prune before mask interpolation to reduce interpolation cost.
+        # Otherwise max_dets_per_img pruning happens only after masks are
+        # already resized, so reducing max_dets_per_img has little speed impact.
+        if (
+            pred_masks is not None
+            and keep is None
+            and self.max_dets_per_img > 0
+            and isinstance(scores, torch.Tensor)
+            and boxes is not None
+        ):
+            eager_keep = []
+            pruned_boxes = []
+            pruned_scores = []
+            pruned_labels = []
+            for i in range(scores.shape[0]):
+                s_i = scores[i]
+                k_i = torch.ones_like(s_i, dtype=torch.bool)
+                if s_i.numel() > self.max_dets_per_img:
+                    topk_idx = torch.topk(s_i, self.max_dets_per_img, dim=0).indices
+                    k_i = torch.zeros_like(s_i, dtype=torch.bool)
+                    k_i[topk_idx] = True
+
+                eager_keep.append(k_i)
+                pruned_boxes.append(boxes[i][k_i.to(boxes[i].device)])
+                pruned_scores.append(s_i[k_i.to(s_i.device)])
+                pruned_labels.append(labels[i][k_i.to(labels[i].device)])
+
+            keep = eager_keep
+            boxes, scores, labels = pruned_boxes, pruned_scores, pruned_labels
+
         out_masks = self._process_masks(
             target_sizes_masks, pred_masks, consistent=consistent, keep=keep
         )
@@ -158,23 +189,45 @@ class PostProcessImage(nn.Module):
             assert gpu_device.type == "cuda"
             pred_masks = pred_masks.to(device=gpu_device)
         if consistent:
-            assert keep is None, "TODO: implement?"
             # All masks should have the same shape, expected when processing a batch of size 1
             target_size = target_sizes.unique(dim=0)
             assert target_size.size(0) == 1, "Expecting all target sizes to be equal"
-            out_masks = (
-                interpolate(
-                    pred_masks,
-                    target_size.squeeze().tolist(),
-                    mode="bilinear",
-                    align_corners=False,
-                ).sigmoid()
-                > 0.5
-            )
-            if self.convert_mask_to_rle:
-                raise RuntimeError("TODO: implement?")
-            if self.to_cpu:
-                out_masks = out_masks.cpu()
+            resized_hw = target_size.squeeze().tolist()
+
+            if keep is None:
+                out_masks = (
+                    interpolate(
+                        pred_masks,
+                        resized_hw,
+                        mode="bilinear",
+                        align_corners=False,
+                    ).sigmoid()
+                    > 0.5
+                )
+                if self.convert_mask_to_rle:
+                    raise RuntimeError("TODO: implement?")
+                if self.to_cpu:
+                    out_masks = out_masks.cpu()
+            else:
+                assert len(keep) == len(pred_masks)
+                out_masks = [[]] * len(pred_masks)
+                for i, mask in enumerate(pred_masks):
+                    mask = mask[keep[i]]
+                    interpolated = (
+                        interpolate(
+                            mask.unsqueeze(1),
+                            resized_hw,
+                            mode="bilinear",
+                            align_corners=False,
+                        ).sigmoid()
+                        > 0.5
+                    )
+                    if self.convert_mask_to_rle:
+                        out_masks[i] = robust_rle_encode(interpolated.squeeze(1))
+                    else:
+                        out_masks[i] = interpolated
+                        if self.to_cpu:
+                            out_masks[i] = out_masks[i].cpu()
         else:
             out_masks = [[]] * len(pred_masks)
 

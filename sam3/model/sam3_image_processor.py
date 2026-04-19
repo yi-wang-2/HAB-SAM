@@ -14,16 +14,31 @@ from torchvision.transforms import v2
 class Sam3Processor:
     """ """
 
-    def __init__(self, model, resolution=1008, device="cuda", confidence_threshold=0.5):
+    def __init__(
+        self,
+        model,
+        resolution=1008,
+        device="cuda",
+        confidence_threshold=0.5,
+        norm_mean_rgb=None,
+        norm_std_rgb=None,
+        norm_mean_extra=None,
+        norm_std_extra=None,
+    ):
         self.model = model
         self.resolution = resolution
         self.device = device
+        self.norm_mean_rgb = [0.5, 0.5, 0.5] if norm_mean_rgb is None else list(norm_mean_rgb)
+        self.norm_std_rgb = [0.5, 0.5, 0.5] if norm_std_rgb is None else list(norm_std_rgb)
+        # Lake-SH 统计值（0-1范围）
+        self.norm_mean_extra = [0.55862757, 0.02709984] if norm_mean_extra is None else list(norm_mean_extra)
+        self.norm_std_extra = [0.06030450, 0.07032378] if norm_std_extra is None else list(norm_std_extra)
         self.transform = v2.Compose(
             [
                 v2.ToDtype(torch.uint8, scale=True),
                 v2.Resize(size=(resolution, resolution)),
                 v2.ToDtype(torch.float32, scale=True),
-                v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+                v2.Normalize(mean=self.norm_mean_rgb, std=self.norm_std_rgb),
             ]
         )
         self.confidence_threshold = confidence_threshold
@@ -41,13 +56,13 @@ class Sam3Processor:
     def _normalize_transform_for_channels(self, num_channels: int):
         if num_channels == 5:
             self.transform.transforms[-1] = v2.Normalize(
-                mean=[0.5, 0.5, 0.5, 0.5, 0.5],
-                std=[0.5, 0.5, 0.5, 0.5, 0.5],
+                mean=self.norm_mean_rgb + self.norm_mean_extra,
+                std=self.norm_std_rgb + self.norm_std_extra,
             )
         else:
             self.transform.transforms[-1] = v2.Normalize(
-                mean=[0.5, 0.5, 0.5],
-                std=[0.5, 0.5, 0.5],
+                mean=self.norm_mean_rgb,
+                std=self.norm_std_rgb,
             )
 
     @torch.inference_mode()

@@ -617,10 +617,12 @@ class Block(nn.Module):
                 nn.Dropout(adapter_dropout),
                 nn.Linear(adapter_hidden, dim),
             )
+            self.adapter_attn_scale = nn.Parameter(torch.tensor(adapter_init_scale))
             self.adapter_post_scale = nn.Parameter(torch.tensor(adapter_init_scale))
         else:
             self.adapter_attn = None
             self.adapter_post = None
+            self.adapter_attn_scale = None
             self.adapter_post_scale = None
 
     def forward(self, x: Tensor) -> Tensor:
@@ -637,7 +639,7 @@ class Block(nn.Module):
             x = window_unpartition(x, self.window_size, pad_hw, (H, W))
 
         if self.use_adapter:
-            x = x + self.adapter_attn(x)
+            x = x + self.adapter_attn_scale * self.adapter_attn(x)
 
         x = shortcut + self.dropout(self.drop_path(x))
 
@@ -659,13 +661,15 @@ class SpatialAttention(nn.Module):
         nn.init.constant_(self.conv1.bias, 5.0)
         nn.init.zeros_(self.conv1.weight)
         self.sigmoid = nn.Sigmoid()
+        self.sa_res_scale = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, x):
         avg_out = torch.mean(x, dim=1, keepdim=True)
         max_out, _ = torch.max(x, dim=1, keepdim=True)
         y = torch.cat([avg_out, max_out], dim=1)
         y = self.conv1(y)
-        return x * self.sigmoid(y)
+        gate = self.sigmoid(y)
+        return x + self.sa_res_scale * x * (gate - 1.0)
 
 class InputChannelAttention(nn.Module):
     def __init__(self, in_chans, reduction=2):
@@ -682,6 +686,7 @@ class InputChannelAttention(nn.Module):
         nn.init.constant_(self.fc[2].bias, 5.0)
         nn.init.zeros_(self.fc[2].weight)
         self.sigmoid_ca = nn.Sigmoid()
+        self.ca_res_scale = nn.Parameter(torch.tensor(1.0))
         self.spatial_attention = SpatialAttention(kernel_size=7)
 
     def forward(self, x):
@@ -689,7 +694,7 @@ class InputChannelAttention(nn.Module):
         y_avg = self.fc(self.avg_pool(x).view(b, c))
         y_max = self.fc(self.max_pool(x).view(b, c))
         y_c = self.sigmoid_ca(y_avg + y_max).view(b, c, 1, 1)
-        x_c = x * y_c.expand_as(x)
+        x_c = x + self.ca_res_scale * x * (y_c - 1.0)
         return self.spatial_attention(x_c)
 
 class ViT(nn.Module):

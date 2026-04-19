@@ -580,6 +580,7 @@ class Masks(LossWithWeights):
         num_sample_points=None,
         oversample_ratio=None,
         importance_sample_ratio=None,
+        boundary_kernel_size=3,
         apply_loss_to_det_queries_in_video_grounding=True,
     ):
         super().__init__(weight_dict, compute_aux)
@@ -590,10 +591,70 @@ class Masks(LossWithWeights):
         self.num_sample_points = num_sample_points
         self.oversample_ratio = oversample_ratio
         self.importance_sample_ratio = importance_sample_ratio
+        self.boundary_kernel_size = boundary_kernel_size
         self.apply_loss_to_det_queries_in_video_grounding = (
             apply_loss_to_det_queries_in_video_grounding
         )
         self.target_keys.extend(["masks", "is_valid_mask"])
+
+    def _total_variation_loss(self, src_masks, num_boxes):
+        if src_masks.numel() == 0:
+            return src_masks.sum() * 0.0
+        probs = src_masks.sigmoid()
+        tv_h = torch.abs(probs[:, 1:, :] - probs[:, :-1, :]).mean(dim=(1, 2))
+        tv_w = torch.abs(probs[:, :, 1:] - probs[:, :, :-1]).mean(dim=(1, 2))
+        return (tv_h + tv_w).sum() / num_boxes
+
+    def _morphological_gradient(self, x):
+        pad = self.boundary_kernel_size // 2
+        dilated = F.max_pool2d(
+            x,
+            kernel_size=self.boundary_kernel_size,
+            stride=1,
+            padding=pad,
+        )
+        eroded = -F.max_pool2d(
+            -x,
+            kernel_size=self.boundary_kernel_size,
+            stride=1,
+            padding=pad,
+        )
+        return dilated - eroded
+
+    def _boundary_loss(self, src_masks, target_masks, num_boxes):
+        if src_masks.numel() == 0:
+            return src_masks.sum() * 0.0
+        pred_prob = src_masks.sigmoid().unsqueeze(1)
+        tgt_prob = target_masks.clamp(0.0, 1.0).unsqueeze(1)
+        pred_boundary = self._morphological_gradient(pred_prob)
+        tgt_boundary = self._morphological_gradient(tgt_prob)
+        # Match boundary responses directly to sharpen transitions near object edges.
+        loss = F.l1_loss(pred_boundary, tgt_boundary, reduction="none")
+        return loss.flatten(1).mean(1).sum() / num_boxes
+
+    def _prepare_dense_masks(self, src_masks, target_masks):
+        if target_masks.shape[0] == 0 and src_masks.shape[0] == 0:
+            return src_masks, target_masks.reshape(src_masks.shape).to(src_masks)
+
+        if len(src_masks.shape) == 3:
+            src_masks = src_masks[:, None]
+
+        if src_masks.dtype == torch.bfloat16:
+            # Bilinear interpolation does not support bf16.
+            src_masks = src_masks.to(dtype=torch.float32)
+
+        src_masks = src_masks[:, 0]
+        target_masks = target_masks.to(src_masks)
+
+        if src_masks.shape[-2:] != target_masks.shape[-2:]:
+            src_masks = interpolate(
+                src_masks[:, None],
+                size=target_masks.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )[:, 0]
+
+        return src_masks, target_masks
 
     def _sampled_loss(self, src_masks, target_masks, num_boxes):
         assert len(src_masks.shape) == 3 and len(target_masks.shape) == 3
@@ -658,6 +719,8 @@ class Masks(LossWithWeights):
             return {
                 "loss_mask": torch.tensor(0.0, device=src_masks.device),
                 "loss_dice": torch.tensor(0.0, device=src_masks.device),
+                "loss_tv": torch.tensor(0.0, device=src_masks.device),
+                "loss_boundary": torch.tensor(0.0, device=src_masks.device),
             }
 
         target_masks = (
@@ -675,6 +738,9 @@ class Masks(LossWithWeights):
         # Remove invalid masks from loss
         src_masks = src_masks[keep]
         target_masks = target_masks[keep]
+        dense_src_masks, dense_target_masks = self._prepare_dense_masks(
+            src_masks, target_masks
+        )
 
         if self.num_sample_points is not None:
             # Compute loss on sampled points for the Mask
@@ -710,6 +776,11 @@ class Masks(LossWithWeights):
                 ),
                 "loss_dice": dice_loss(src_masks, target_masks, num_boxes),
             }
+
+        losses["loss_tv"] = self._total_variation_loss(dense_src_masks, num_boxes)
+        losses["loss_boundary"] = self._boundary_loss(
+            dense_src_masks, dense_target_masks, num_boxes
+        )
 
         return losses
 
