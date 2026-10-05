@@ -11,11 +11,13 @@ from sam3.model_builder import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
 
 
-def _load_5ch(image_path: Path, absi_path: Path, sub_path: Path) -> np.ndarray:
+def _load_5ch(image_path: Path, cbsi_path: Path, bp_path: Path) -> np.ndarray:
     rgb = np.array(Image.open(image_path).convert("RGB"))
-    absi = np.array(Image.open(absi_path).convert("L"))[..., None]
-    sub = np.array(Image.open(sub_path).convert("L"))[..., None]
-    return np.concatenate([rgb, absi, sub], axis=-1)
+    cbsi = np.array(Image.open(cbsi_path).convert("L"))[..., None]
+    bp = np.array(Image.open(bp_path).convert("L"))[..., None]
+    if cbsi.shape[:2] != rgb.shape[:2] or bp.shape[:2] != rgb.shape[:2]:
+        raise ValueError("RGB, CBSI, and BP images must have the same height and width")
+    return np.concatenate([rgb, cbsi, bp], axis=-1)
 
 
 def _to_model_input_tensor(processor: Sam3Processor, image_5ch: np.ndarray, device: str) -> torch.Tensor:
@@ -34,7 +36,7 @@ def _compute_attention_maps(ca_module, x: torch.Tensor):
         y_max = ca_module.fc(ca_module.max_pool(x).view(b, c))
         y_c = ca_module.sigmoid_ca(y_avg + y_max).view(b, c, 1, 1)
 
-        x_c = x * y_c.expand_as(x)
+        x_c = x + ca_module.ca_res_scale * x * (y_c - 1.0)
 
         avg_out = torch.mean(x_c, dim=1, keepdim=True)
         max_out, _ = torch.max(x_c, dim=1, keepdim=True)
@@ -49,8 +51,8 @@ def main():
     ap = argparse.ArgumentParser(description="Visualize channel/spatial attention maps for SAM3 InputChannelAttention")
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--image", required=True)
-    ap.add_argument("--absi", required=True)
-    ap.add_argument("--sub", required=True)
+    ap.add_argument("--cbsi", "--absi", dest="cbsi", required=True, help="8-bit CBSI map; --absi is a legacy alias")
+    ap.add_argument("--bp", "--sub", dest="bp", required=True, help="8-bit BP map; --sub is a legacy alias")
     ap.add_argument("--output-dir", default="output/attention_vis")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--in-chans", type=int, default=5)
@@ -77,7 +79,7 @@ def main():
 
     processor = Sam3Processor(model, device=args.device)
 
-    image_5ch = _load_5ch(Path(args.image), Path(args.absi), Path(args.sub))
+    image_5ch = _load_5ch(Path(args.image), Path(args.cbsi), Path(args.bp))
     x = _to_model_input_tensor(processor, image_5ch, args.device)
 
     ca_module = model.backbone.vision_backbone.trunk.channel_attention
@@ -87,7 +89,7 @@ def main():
     channel_gate, spatial_gate = _compute_attention_maps(ca_module, x)
 
     # Save numeric channel gate values
-    channel_names = ["R", "G", "B", "ABSI", "SUB"][: len(channel_gate)]
+    channel_names = ["R", "G", "B", "CBSI", "BP"][: len(channel_gate)]
     txt_path = out_dir / "channel_gate_values.txt"
     with txt_path.open("w", encoding="utf-8") as f:
         for n, v in zip(channel_names, channel_gate.tolist()):

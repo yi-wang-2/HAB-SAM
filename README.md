@@ -1,14 +1,14 @@
 # HAB-SAM
 
-**A Physics-Informed Adaptation of Segment Anything Model for Harmful Algal Blooms Segmentation from UAV Imagery**
+**Physics-Guided Adaptation of the Segment Anything Model for Mapping Harmful Algal Blooms from UAV Imagery**
 
-HAB-SAM is a physics-informed model for semantic segmentation of harmful algal blooms (HABs) in UAV RGB imagery. Built on SAM3, it incorporates optical priors computed directly from RGB images and uses parameter-efficient fine-tuning to adapt pretrained visual representations to complex water-surface scenes.
+HAB-SAM is a physics-guided model for semantic segmentation of harmful algal blooms (HABs) in UAV RGB imagery. Built on SAM3, it incorporates optical priors computed directly from RGB images and uses parameter-efficient fine-tuning to adapt pretrained visual representations to complex water-surface scenes.
 
 This repository contains the HAB-SAM model implementation, training configurations, data-processing utilities, evaluation code, and attention-visualization tools.
 
 ## Model Overview
 
-HAB-SAM augments SAM3 with the RGB-derived Cyanobacterial Bloom Sensitive Index (CBSI) and Brightness Penalty (BP), producing a five-channel `RGB + CBSI + BP` input. Domain adaptation is implemented through an expanded patch embedding, channel-spatial attention, and lightweight adapters. During training, the SAM3 backbone is frozen while the newly introduced modules and mask decoder are updated.
+HAB-SAM augments SAM3 with the RGB-derived Cyanobacterial Bloom Sensitive Index (CBSI) and Brightness Penalty (BP), producing a five-channel `RGB + CBSI + BP` input. Domain adaptation is implemented through an expanded patch embedding, channel-spatial attention, and lightweight adapters. During training, the original RGB patch-embedding weights, native image-encoder blocks, and text and geometry encoders remain frozen. The CBSI- and BP-specific patch-embedding weights, channel-spatial attention, adapters, and complete mask decoder are trainable.
 
 ![HAB-SAM architecture](assets/hab-sam-architecture.png)
 
@@ -64,6 +64,8 @@ hf auth login
 ```
 
 ## Data Preparation
+
+The Dianchi Blue-green Algae UAV dataset used in the paper is available at [Kaggle](https://www.kaggle.com/datasets/danielyiii/bluegreen-algea-bloom). Images were split within each bloom-severity level into training, validation, and test subsets at a 7:2:1 ratio; the level-specific subsets were then combined. Each final partition therefore contains approximately the same proportion of images from each level. The independent public blue-green algae dataset is used for the cross-dataset evaluation described in the paper.
 
 Training data use COCO-format annotations with the following default structure:
 
@@ -163,6 +165,18 @@ The accompanying paper reports the following pixel-level semantic segmentation m
 
 For models that produce multiple instance masks, merge them into a single binary bloom mask before comparing them with the same pixel-level ground truth.
 
+### Results reported in the manuscript
+
+| Evaluation | HAB-SAM mIoU |
+| --- | ---: |
+| Dianchi Lake dataset, Level 3 | 81.95% |
+| Dianchi Lake dataset, Level 2 | 83.03% |
+| Dianchi Lake dataset, Level 1 | 83.84% |
+| Public dataset test set, direct transfer without target-domain fine-tuning | 67.92% |
+| Public dataset test set, after further fine-tuning on its training partition | 84.30% |
+
+Values are means over five independent training runs. Direct transfer uses the Dianchi-trained model; public-dataset fine-tuning starts from that state. The two public-dataset results should not be interpreted as the same evaluation setting.
+
 ## Attention Visualization
 
 Use a trained checkpoint to inspect how the five-channel priors affect channel-spatial attention:
@@ -171,6 +185,8 @@ Use a trained checkpoint to inspect how the five-channel priors affect channel-s
 python scripts/visualize_channel_spatial_attention.py \
   --checkpoint output/<experiment>/checkpoints/checkpoint.pt \
   --image data/lake_sh/images/<image>.jpg \
+  --cbsi /path/to/matching_cbsi.png \
+  --bp /path/to/matching_bp.png \
   --output-dir output/attention_visualization \
   --device cuda \
   --in-chans 5 \
@@ -179,7 +195,7 @@ python scripts/visualize_channel_spatial_attention.py \
   --adapter-init-scale 1.0
 ```
 
-The `--absi` and `--sub` options can be used to provide additional prior channels explicitly. Refer to the script's command-line help for the expected inputs.
+The `--cbsi` and `--bp` options are required for this visualization script. Supply single-channel, 8-bit prior maps generated from the same RGB image. The training data pipeline computes these maps automatically; the visualization script currently takes them as explicit files. The former `--absi` and `--sub` option names remain accepted as aliases for older commands.
 
 ## Training Configuration
 
@@ -198,15 +214,15 @@ The selected YAML configuration and command-line overrides are the authoritative
 
 ## Citation
 
-If this project is useful to your research, please cite the HAB-SAM paper. Replace the placeholders below when the final publication details become available:
+If you use HAB-SAM, please cite the manuscript. The entry below does not imply journal acceptance; publication details will be added when available.
 
 ```bibtex
-@article{habsam,
-  title   = {HAB-SAM: A Physics-Informed Adaptation of Segment Anything Model
-             for Harmful Algal Blooms Segmentation from UAV Imagery},
-  author  = {...},
-  journal = {...},
-  year    = {...}
+@unpublished{wang_habsam,
+  author = {Wang, Yi and Wang, Fei and Gong, Zhigang and Wu, Xuke and
+            Wang, Jingkai and Zhang, Qichao and Shan, Kun},
+  title  = {HAB-SAM: Physics-Guided Adaptation of the Segment Anything Model
+            for Mapping Harmful Algal Blooms from UAV Imagery},
+  note   = {Manuscript}
 }
 ```
 
