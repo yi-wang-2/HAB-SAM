@@ -217,8 +217,8 @@ The selected YAML configuration and command-line overrides are the authoritative
 If you use HAB-SAM, please cite the manuscript. The entry below does not imply journal acceptance; publication details will be added when available.
 
 ```bibtex
-@unpublished{wang_habsam,
-  author = {Wang, Yi and Wang, Fei and Gong, Zhigang and Wu, Xuke and
+@unpublished{yi_habsam,
+  author = {Yi, Wang and Wang, Fei and Gong, Zhigang and Wu, Xuke and
             Wang, Jingkai and Zhang, Qichao and Shan, Kun},
   title  = {HAB-SAM: Physics-Guided Adaptation of the Segment Anything Model
             for Mapping Harmful Algal Blooms from UAV Imagery},
